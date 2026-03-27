@@ -1,4 +1,4 @@
-# AI Arena Architecture
+# AI Arena Architecture (Consolidated)
 
 ## Purpose
 
@@ -11,6 +11,8 @@ It is designed to prove one thing well:
 `AI decision -> on-chain record -> confidence gate -> guarded execution -> outcome tracking`
 
 This is not a production trading platform.
+
+This is the final consolidated version after three review rounds (R1-R16, P1-P3, F1-F3).
 
 ---
 
@@ -49,9 +51,10 @@ The user experiences one product, but technically the trust layer sits between a
 Responsibilities:
 
 - render arena dashboard
-- show agent states
-- show decision feed
+- show agent states and current positions
+- show decision feed with gate evaluation visualization
 - show execution and gate results
+- show Solana Explorer links for on-chain transactions
 - show off-chain leaderboard
 
 Recommended stack:
@@ -68,6 +71,7 @@ Responsibilities:
 - trigger agent cycle manually for demo
 - return indexed decision and execution history
 - expose leaderboard data
+- serve reasoning full text from SQLite by decision PDA
 
 Recommended stack:
 
@@ -78,38 +82,44 @@ Recommended stack:
 
 Responsibilities:
 
-- fetch market snapshot
-- run agent logic
+- fetch market snapshot (with cycle_id)
+- run agent logic (deterministic signal + LLM confidence/reasoning)
 - produce structured decision payload
+- persist reasoning to SQLite with `pending` status
 - submit decision transaction
-- trigger gate evaluation
+- update reasoning status to `confirmed` or `failed`
 - trigger execution when approved
 
 ### Market Data Service
 
 Responsibilities:
 
-- fetch or normalize `SOL/USDC` market data
-- compute indicators for all agents
+- fetch `SOL/USDC` market data
+- read Pyth oracle price for canonical reference
+- compute indicators for all agents (SMA, momentum, volatility)
 - generate a canonical market snapshot for each cycle
+- include `cycle_id` in snapshot to match on-chain cycle counter
 
 ### Indexer / Read Model
 
 Responsibilities:
 
-- index on-chain decision and execution accounts
+- index on-chain decision, execution, and position accounts
 - compute leaderboard metrics
 - serve query-friendly data to frontend
+
+Implementation: `getProgramAccounts` with memcmp filters on account type discriminator. Refresh every 3 seconds or on-demand after cycle completion.
 
 ### Solana Program
 
 Responsibilities:
 
 - store arena state
-- register agents
-- record decisions
+- register agents and initialize positions
+- record decisions with oracle price
 - evaluate gate rules
-- record executions and outcomes
+- record executions and update positions
+- record outcomes and update PnL
 
 ---
 
@@ -117,23 +127,35 @@ Responsibilities:
 
 ### Decision Cycle
 
-1. backend requests a fresh market snapshot
-2. market data service normalizes the snapshot
-3. agent runtime sends the same snapshot to all agents
-4. each agent returns a structured decision
-5. backend submits `record_decision`
-6. backend submits `evaluate_gate`
-7. if gate passes, backend submits `execute_decision`
-8. backend submits `record_outcome`
-9. indexer updates leaderboard
-10. frontend renders updated state
+```
+Cycle N:
+  1. record_outcome for Cycle N-1 decisions (using current oracle price)
+  2. fetch market snapshot (indicators + cycle_id)
+  3. agent runtime sends the same snapshot to all agents
+  4. each agent returns a structured decision
+  5. backend persists reasoning to SQLite (status: pending)
+  6. backend submits `submit_decision` (records decision + evaluates gate atomically)
+  7. backend updates reasoning status (confirmed / failed)
+  8. if gate passed, backend submits `execute_decision`
+  9. indexer updates leaderboard
+  10. frontend renders updated state
+```
 
 ### Why this flow is correct for the hackathon
 
 - AI output exists before on-chain change
-- the contract records the decision before execution
-- the gate is explicit and visible
+- the contract records the decision and gate result in one atomic write
 - blocked decisions still become part of the audit trail
+- reasoning text survives backend restarts (SQLite)
+- oracle price is read on-chain, not trusted from backend
+
+### Transaction count per cycle
+
+- `record_outcome` × 3 agents (previous cycle) = 3 tx
+- `submit_decision` × 3 agents = 3 tx
+- `execute_decision` × approved agents only = 0-3 tx
+
+Total: 6-9 transactions per cycle. At ~400ms each on devnet = 2.4-3.6 seconds.
 
 ---
 
@@ -143,102 +165,163 @@ Responsibilities:
 
 #### ArenaState
 
-Purpose:
+PDA seeds: `["arena", authority]`
 
-- top-level arena configuration
+Purpose: top-level arena configuration.
 
-Suggested fields:
+Fields:
 
-- authority
-- active pair
-- cycle counter
-- active agents count
-- default min confidence
-- default max trade size
-- cooldown seconds
+- `authority: Pubkey` — deployer, can register agents
+- `operator: Pubkey` — backend wallet, can submit decisions and execute
+- `active_pair: String` — max 12 chars, e.g. "SOL/USDC"
+- `cycle_counter: u64` — incremented each cycle
+- `agents_count: u8` — number of registered agents
+- `min_confidence: u8` — default confidence threshold
+- `max_trade_size: u64` — default max order size
+- `cooldown_seconds: i64` — min time between agent decisions
+- `bump: u8`
+
+Estimated size: ~115 bytes
 
 #### AgentProfile
 
-Purpose:
+PDA seeds: `["agent", arena, agent_id (u64 bytes)]`
 
-- one record per pre-built agent
+Purpose: one record per pre-built agent.
 
-Suggested fields:
+Fields:
 
-- arena
-- agent id
-- strategy name
-- model id
-- status
-- max trade size
-- last decision timestamp
+- `arena: Pubkey`
+- `agent_id: u64`
+- `strategy_name: String` — max 32 chars
+- `model_id: String` — max 32 chars
+- `status: AgentStatus` — enum: Active, Paused, Stopped
+- `max_trade_size: u64` — per-agent override
+- `last_decision_ts: i64`
+- `bump: u8`
+
+Estimated size: ~138 bytes
+
+#### AgentPosition
+
+PDA seeds: `["position", arena, agent_id (u64 bytes)]`
+
+Purpose: persistent position state across cycles. Without this, guardrails like max_position_size and cooldown cannot be enforced on-chain.
+
+Fields:
+
+- `arena: Pubkey`
+- `agent: Pubkey`
+- `current_side: PositionSide` — enum: `Flat`, `Long` (no Short in MVP)
+- `current_size: u64` — current position size in base units
+- `average_entry_price: u64` — weighted average entry, fixed-point (price × 10^6)
+- `realized_pnl: i64` — accumulated realized PnL across cycles
+- `unrealized_pnl: i64` — last computed unrealized PnL
+- `total_executed: u64` — total number of executed decisions
+- `last_executed_cycle: u64` — cycle_id of last execution
+- `last_executed_at: i64` — timestamp of last execution
+- `bump: u8`
+
+Estimated size: ~130 bytes
+
+No `Short` variant in MVP. The system only supports Flat and Long positions. This aligns with the no-leverage, no-shorting MVP boundary.
 
 #### DecisionRecord
 
-Purpose:
+PDA seeds: `["decision", arena, agent, cycle_id (u64 bytes)]`
 
-- one on-chain record for one agent decision
+Purpose: one on-chain record for one agent decision. Seeds guarantee one decision per agent per cycle at the protocol level.
 
-Suggested fields:
+Fields:
 
-- arena
-- agent
-- cycle id
-- input hash
-- action
-- side
-- amount
-- confidence
-- reasoning hash
-- gate status
-- created at
+- `arena: Pubkey`
+- `agent: Pubkey`
+- `cycle_id: u64`
+- `input_hash: [u8; 32]` — SHA-256 of the market snapshot
+- `action: DecisionAction` — enum: Buy, Sell, Hold
+- `side: TradeSide` — enum: Base (SOL), Quote (USDC)
+- `amount: u64`
+- `confidence: u8` — 0-100
+- `reasoning_hash: [u8; 32]` — SHA-256 of full reasoning text
+- `gate_status: GateStatus` — enum: Approved, BlockedLowConfidence, BlockedRiskLimit, BlockedPositionLimit, BlockedCooldown
+- `oracle_price: u64` — Pyth price at decision time, fixed-point (price × 10^6)
+- `oracle_timestamp: i64` — Pyth publish_time
+- `oracle_confidence: u64` — Pyth confidence interval
+- `created_at: i64`
+- `bump: u8`
+
+Estimated size: ~197 bytes
+
+Price model: `oracle_price` is the **execution-time reference price** read from Pyth on-chain during `submit_decision`. This is NOT necessarily the exact price the AI saw in the snapshot — there may be a small delta. The AI's input context is captured via `input_hash`. PnL is always calculated using on-chain oracle prices.
 
 #### ConfidenceGate
 
-Purpose:
+PDA seeds: `["gate", arena]`
 
-- explicit policy account for gate evaluation
+Purpose: explicit policy account for gate evaluation.
 
-Suggested fields:
+Fields:
 
-- arena
-- min confidence
-- max trade size
-- allowed actions bitmask or enum set
-- block low confidence
-- block oversize orders
+- `arena: Pubkey`
+- `min_confidence: u8` — minimum confidence to pass gate
+- `max_trade_size: u64` — maximum single order size
+- `allowed_actions: u8` — bitmask (bit 0 = Buy, bit 1 = Sell, bit 2 = Hold)
+- `bump: u8`
+
+Estimated size: ~51 bytes
 
 #### ExecutionRecord
 
-Purpose:
+PDA seeds: `["execution", decision]`
 
-- one record for attempted or completed execution
+Purpose: one record for attempted or completed execution. Seeds guarantee one execution attempt per decision.
 
-Suggested fields:
+Fields:
 
-- decision
-- executed flag
-- blocked flag
-- execution price
-- resulting position delta
-- pnl delta
-- timestamp
+- `decision: Pubkey`
+- `executed: bool`
+- `blocked: bool`
+- `execution_price: u64` — oracle price at execution, fixed-point
+- `position_delta: i64` — change in position size
+- `pnl_delta: i64` — realized PnL from this execution
+- `timestamp: i64`
+- `bump: u8`
 
-### Important Solana Constraint
+Estimated size: ~75 bytes
 
-Do not use unbounded vectors like:
+### Account Size Summary
 
-- `decisions[]`
-- `executions[]`
-- `investors[]`
+```
+ArenaState          ["arena", authority]                    ~115 bytes    ×1
+AgentProfile        ["agent", arena, agent_id]              ~138 bytes    ×3
+AgentPosition       ["position", arena, agent_id]           ~130 bytes    ×3
+DecisionRecord      ["decision", arena, agent, cycle_id]    ~197 bytes    ×N (3 per cycle)
+ConfidenceGate      ["gate", arena]                         ~51 bytes     ×1
+ExecutionRecord     ["execution", decision]                 ~75 bytes     ×N (0-3 per cycle)
+```
 
-Every decision and execution must be a separate PDA-derived record.
+Rent cost: each DecisionRecord ~0.002 SOL. 3 agents × 50 cycles = 150 records = ~0.3 SOL total on devnet.
 
-This keeps the account model realistic and reviewable.
+### Important Solana Constraints
+
+- Do not use unbounded vectors like `decisions[]`, `executions[]`, `investors[]`
+- Every decision and execution must be a separate PDA-derived record
+- All string fields must have defined max lengths (see sizes above)
+- Deploy with upgrade authority on devnet for iteration speed
 
 ---
 
 ## Program Instructions
+
+### Access Control
+
+```
+initialize_arena:   authority (deployer) — signer
+register_agent:     authority — signer
+submit_decision:    operator (backend wallet) — signer, checked against ArenaState.operator
+execute_decision:   operator — signer
+record_outcome:     operator — signer
+```
 
 ### `initialize_arena`
 
@@ -247,72 +330,89 @@ Creates:
 - `ArenaState`
 - `ConfidenceGate`
 
+Signer: authority
+
 ### `register_agent`
 
 Creates:
 
 - `AgentProfile`
+- `AgentPosition` (initialized to Flat, zero size)
+
+Signer: authority
 
 Used only for the fixed set of pre-built agents.
 
-### `record_decision`
+### `submit_decision`
 
 Creates:
 
 - `DecisionRecord`
 
-Stores:
-
-- structured action
-- confidence
-- input hash
-- reasoning hash
-
-This instruction should not execute any trade.
-
-### `evaluate_gate`
-
 Reads:
 
-- `DecisionRecord`
 - `ConfidenceGate`
 - `AgentProfile`
+- `AgentPosition`
+- Pyth SOL/USD price account (remaining account)
 
-Writes:
+This instruction atomically:
 
-- gate result into `DecisionRecord`
+1. Reads Pyth oracle price and writes `oracle_price`, `oracle_timestamp`, `oracle_confidence`
+2. Stores the structured decision (action, side, amount, confidence, reasoning_hash, input_hash)
+3. Evaluates gate rules against ConfidenceGate config and AgentPosition state
+4. Writes `gate_status` result
 
-Possible results:
+Gate evaluation checks:
 
-- `Approved`
-- `BlockedLowConfidence`
-- `BlockedRiskLimit`
-- `BlockedInvalidAction`
+- `confidence >= gate.min_confidence`
+- `amount <= gate.max_trade_size`
+- `action` is in `gate.allowed_actions`
+- `agent.status == Active`
+- position size after execution would not exceed agent max
+- cooldown has elapsed since last execution
+
+If any check fails, the decision is still recorded but `gate_status` is set to the appropriate blocked reason. No trade is executed.
+
+Signer: operator
 
 ### `execute_decision`
 
 Reads:
 
-- approved `DecisionRecord`
+- approved `DecisionRecord` (must have `gate_status == Approved`)
+
+Writes:
+
+- `AgentPosition` — updates side, size, average_entry_price, last_executed_cycle, last_executed_at
 
 Creates:
 
 - `ExecutionRecord`
 
-This instruction should only execute a bounded action.
+For MVP: use deterministic simulated execution with oracle price as execution price. No dependency on live swap routing.
 
-For MVP it may:
-
-- call a mock execution path
-- or record a deterministic simulated execution
+Signer: operator
 
 ### `record_outcome`
 
-Writes final measurable result:
+Reads:
 
-- execution result
-- pnl delta
-- optional success/failure flag
+- `ExecutionRecord`
+- Pyth price account (current price)
+
+Writes:
+
+- `ExecutionRecord` — updates pnl_delta
+- `AgentPosition` — updates realized_pnl, unrealized_pnl
+
+Timing: called at the START of cycle N for cycle N-1 decisions. Uses current oracle price as exit reference.
+
+Signer: operator
+
+### Optional: `close_decision`
+
+Closes a `DecisionRecord` + associated `ExecutionRecord` and refunds rent to authority. Not required for MVP but shows Solana maturity.
 
 ---
 
@@ -320,26 +420,39 @@ Writes final measurable result:
 
 ### Agent Strategy Layer
 
-Use 2-3 agents only.
+Use exactly 3 agents:
 
-Recommended agents:
+- `Momentum Agent` — buy when short-term momentum is positive, sell when trend weakens, otherwise hold
+- `Mean Reversion Agent` — buy when price drops below recent average, sell when price rises above, otherwise hold
+- `Risk-Off Agent` — prefers hold, only takes small positions, exits early when confidence drops
 
-- `Momentum Agent`
-- `Mean Reversion Agent`
-- `Risk-Off Agent`
+### Agent Implementation: Deterministic + LLM Hybrid
 
-### Agent Implementation Strategy
+The boundary between deterministic and LLM is explicit:
 
-Recommended implementation:
+```
+Deterministic layer (no LLM):
+  - receives: market snapshot (indicators, not raw price)
+  - computes: strategy-specific signal
+  - outputs: { action: buy/sell/hold, amount: N }
 
-- deterministic signal generation
-- LLM used for structured explanation and final action formatting
+LLM layer:
+  - receives: signal + market context + agent persona prompt
+  - outputs: { confidence: 0-100, reasoning: string }
+```
 
-Why this is safer:
+Why this split:
 
-- better reproducibility
-- lower risk of malformed outputs
-- easier demo control
+- The action is deterministic — demo is reproducible, agents behave differently
+- The confidence comes from LLM — the gate has real variance (some pass, some get blocked)
+- The reasoning comes from LLM — readable audit trail for frontend
+- If LLM fails, use default confidence=50 and generic reasoning — graceful degradation
+
+If LLM generates the action itself, you risk:
+
+- malformed outputs killing the demo
+- all 3 agents making the same decision (LLMs tend to converge)
+- no visible difference between agent strategies
 
 ### Structured Decision Schema
 
@@ -355,48 +468,98 @@ All agents must return the same JSON shape:
 }
 ```
 
+No `price` field in the off-chain schema. The canonical price is read from Pyth oracle on-chain during `submit_decision`.
+
 Validation rules:
 
-- `action` must be one of allowed values
-- `amount` must be numeric and bounded
+- `action` must be one of: `buy`, `sell`, `hold`
+- `amount` must be numeric and bounded (0 < amount <= max_trade_size)
 - `confidence` must be `0..100`
-- invalid schema becomes blocked before execution
+- `summary` must be non-empty string
+- invalid schema → decision is blocked before submission
 
 ### Reasoning Storage
 
-Store:
+**SQLite only. Not in-memory.**
 
-- full explanation off-chain
-- explanation hash on-chain
+If the backend restarts, reasoning text must survive. On-chain `reasoning_hash` values without matching text render the audit trail useless during demo.
 
-This keeps on-chain state compact but still auditable.
+Schema:
+
+```sql
+CREATE TABLE reasoning (
+  decision_pda TEXT PRIMARY KEY,
+  reasoning_hash TEXT NOT NULL,
+  full_text TEXT NOT NULL,
+  tx_signature TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_at INTEGER NOT NULL,
+  confirmed_at INTEGER
+);
+```
+
+Lifecycle:
+
+1. Agent produces reasoning → write to SQLite with status `pending`
+2. Submit `submit_decision` transaction
+3. Transaction confirmed → update status to `confirmed`, save `tx_signature` and `confirmed_at`
+4. Transaction failed → update status to `failed`
+5. Transaction retried with new hash → mark old row `orphaned`, create new `pending` row
+
+Frontend API: `GET /api/reasoning/:decisionPda` — returns full text if status is `confirmed`.
+
+### Pricing Model
+
+Two distinct concepts — do not conflate:
+
+**1. Snapshot price (what the AI saw)**
+
+- Part of the market snapshot built by Market Data Service
+- Used by agents to compute signals
+- Captured via `input_hash` (SHA-256 of full snapshot)
+- Not stored on-chain as a separate field
+
+**2. Oracle reference price (for execution and PnL)**
+
+- Read from Pyth SOL/USD on-chain during `submit_decision`
+- Stored in DecisionRecord as `oracle_price`, `oracle_timestamp`, `oracle_confidence`
+- Used as entry price for PnL calculation
+- Used as execution price in `execute_decision`
+- Exit price = oracle price at `record_outcome` (next cycle)
+
+There may be a small delta between snapshot price and oracle price at submit time. This is acceptable for MVP. The key guarantee is: all PnL is calculated from on-chain oracle prices only.
 
 ---
 
 ## Execution Model
 
-### Preferred MVP Mode
+### MVP Mode: Deterministic Simulated Execution
 
-Use deterministic simulated execution.
-
-Meaning:
-
-- execution uses the current market snapshot price
-- the contract records the action and resulting state
+- execution uses the on-chain oracle price at decision time
+- the contract records the action and updates AgentPosition
 - no dependency on unstable live swap routing during demo
 
 ### Why this is preferred
 
 - fewer external failures
 - more stable demo
-- still satisfies the hackathon requirement because AI decisions drive on-chain state changes
+- still satisfies the hackathon requirement: AI decisions drive on-chain state changes
 
 ### Alternative Mode
 
 If the team has extra time:
 
-- add one real devnet swap path
+- add one real devnet swap path via Jupiter
 - keep simulated execution as fallback
+
+### Guardrails (enforced on-chain)
+
+- max trade size per agent (checked in gate)
+- max position size per agent (checked in gate via AgentPosition)
+- cooldown between decisions (checked in gate via AgentPosition.last_executed_at)
+- no leverage
+- no shorting (PositionSide only allows Flat | Long)
+- no multi-hop execution
 
 ---
 
@@ -408,6 +571,7 @@ Leaderboard must remain off-chain.
 
 - decision records
 - execution records
+- agent position states
 - blocked decision counts
 
 ### Metrics
@@ -416,7 +580,8 @@ Leaderboard must remain off-chain.
 - gate pass rate
 - blocked rate
 - executed decisions
-- realized pnl
+- realized PnL
+- unrealized PnL
 - last action time
 
 ### Why off-chain
@@ -433,33 +598,35 @@ Leaderboard must remain off-chain.
 
 Shows:
 
-- agent cards
+- agent cards with current position state
 - recent decisions
-- recent blocked decisions
+- recent blocked decisions (part of the product story)
 - leaderboard
+- Solana Explorer links for on-chain transactions
 
 ### Agent Details
 
 Shows:
 
 - strategy description
-- current status
+- current position (side, size, entry price, PnL)
+- model id
 - decision timeline
 - gate results
 - execution history
 
 ### Decision Feed
 
-Each event should show:
+Each event should show visual gate evaluation:
 
-- agent
-- action
-- confidence
-- gate result
-- executed or blocked
-- timestamp
+```
+[Decision] -> [Gate: confidence 84 >= 70? PASS] -> [Executed at $145.20] -> [Result: +$2.30]
+[Decision] -> [Gate: confidence 42 >= 70? FAIL] -> [Blocked: LowConfidence]
+```
 
-This feed is central to the product story.
+This feed is central to the product story. The visual gate step makes the PoI layer tangible to judges in 2 seconds.
+
+Each decision and execution shows a clickable Solana Explorer link (devnet). This is a powerful proof moment for judges.
 
 ---
 
@@ -468,10 +635,11 @@ This feed is central to the product story.
 ### Minimal Deployment Setup
 
 - Solana Devnet
-- one deployed Anchor program
+- one deployed Anchor program (with upgrade authority)
 - one backend service
 - one frontend app
-- one small indexer process
+- one SQLite file for reasoning
+- indexer runs as part of backend process
 
 ### Demo Control
 
@@ -481,14 +649,25 @@ Add one manual trigger:
 
 This button should:
 
-- fetch market snapshot
-- run all agents
-- submit decisions
-- evaluate gate
-- execute approved actions
-- refresh UI
+1. record outcomes for previous cycle
+2. fetch market snapshot with cycle_id
+3. run all agents (deterministic signal + LLM)
+4. persist reasoning to SQLite
+5. submit decisions on-chain
+6. execute approved actions
+7. refresh UI
 
 This reduces demo randomness.
+
+### Pre-seeding
+
+Before demo, pre-run 5-10 cycles so the dashboard already shows:
+
+- decision history
+- leaderboard with differentiated scores
+- some blocked decisions in the feed
+
+The live "Run Next Cycle" adds a fresh decision on top of existing history.
 
 ---
 
@@ -496,48 +675,38 @@ This reduces demo randomness.
 
 ### Invalid AI Output
 
-Handling:
-
 - reject at schema validation layer
 - optionally write blocked record with reason
 
 ### Low Confidence
 
-Handling:
+- decision is still recorded on-chain
+- marked as blocked by gate
+- not executed
 
-- record decision
-- mark blocked by gate
-- do not execute
+### Oversized Action / Position Limit
 
-### Oversized Action
-
-Handling:
-
-- record decision
-- mark blocked by risk rule
-- do not execute
+- decision is still recorded on-chain
+- marked as blocked by risk rule
+- not executed
 
 ### RPC Failure
-
-Handling:
 
 - retry once or twice
 - show pending state in UI
 - do not fake success
+- reasoning status remains `pending` in SQLite
 
 ### Market Data Failure
-
-Handling:
 
 - use last valid snapshot with stale marker
 - or skip cycle cleanly
 
 ### LLM Failure
 
-Handling:
-
-- skip that agent cycle
-- show agent error state
+- skip that agent's LLM call
+- use deterministic signal with default confidence=50
+- show agent warning state
 - continue processing other agents
 
 ---
@@ -547,13 +716,13 @@ Handling:
 For MVP:
 
 - no leverage
-- no short positions
+- no short positions (PositionSide: Flat | Long only)
 - no external user funds
 - no dynamic agent uploads
 - bounded order size per agent
-- cooldown between decisions
-
-This is essential for keeping the system believable and safe.
+- bounded position size per agent (enforced via AgentPosition)
+- cooldown between decisions (enforced via AgentPosition)
+- operator wallet is the only signer for state-changing instructions
 
 ---
 
@@ -561,35 +730,27 @@ This is essential for keeping the system believable and safe.
 
 ### Priority 1
 
-- on-chain decision recording
-- confidence gate
-- structured agent output
+- on-chain accounts (ArenaState, AgentProfile, AgentPosition, DecisionRecord, ConfidenceGate)
+- `submit_decision` instruction with gate evaluation
+- structured agent output (deterministic + LLM hybrid)
+- SQLite reasoning storage
 
 ### Priority 2
 
-- deterministic execution
-- execution records
+- `execute_decision` with AgentPosition updates
+- `record_outcome` with PnL calculation
+- ExecutionRecord
 - decision feed UI
 
 ### Priority 3
 
 - leaderboard
-- charts
-- visual polish
+- Pyth oracle integration
+- Explorer links
+- charts and visual polish
+- pre-seeded demo data
 
 If time gets tight, never sacrifice the core decision-to-gate-to-record loop for cosmetic features.
-
----
-
-## Review Questions
-
-When giving this document to reviewers, ask them to focus on:
-
-- whether the on-chain account model is realistic
-- whether the scope is small enough for the deadline
-- whether simulated execution is acceptable for the demo
-- whether the PoI Gate boundary is clear enough
-- whether any unnecessary complexity remains
 
 ---
 
@@ -607,276 +768,43 @@ not as:
 
 ---
 
-## Architecture Review Notes
-
-Independent review of the architecture with concrete issues, risks, and improvements.
-
-Organized by severity: **critical** (blocks demo or loses major points), **important** (weakens the submission), **nice-to-have** (polish if time allows).
-
----
-
-### Critical
-
-#### R1. PDA seeds are not defined
-
-The document says "PDA-derived records" but never specifies the seeds. This is the first thing needed for implementation and the most common source of bugs.
-
-Recommended seeds:
-
-```
-ArenaState:       ["arena", authority]
-AgentProfile:     ["agent", arena, agent_id (u64 bytes)]
-DecisionRecord:   ["decision", arena, agent, cycle_id (u64 bytes)]
-ConfidenceGate:   ["gate", arena]
-ExecutionRecord:  ["execution", decision]
-```
-
-Why this matters:
-
-- `DecisionRecord` keyed on `[arena, agent, cycle_id]` guarantees one decision per agent per cycle — enforced at the protocol level, not just off-chain
-- `ExecutionRecord` keyed on `[decision]` guarantees one execution attempt per decision
-- Without defined seeds, two developers will implement different PDA schemes and break each other's work
-
-#### R2. Three transactions per decision is too slow for demo
-
-Current flow per agent: `record_decision` → `evaluate_gate` → `execute_decision` = 3 transactions.
-
-For 3 agents per cycle = 9 transactions. At ~400ms confirmation each on devnet = **3.6 seconds minimum**, often 5-8 seconds with network jitter.
-
-During a live demo with the "Run Next Cycle" button, the audience will watch a spinner for 5-8 seconds. That's too long.
-
-Recommended fix:
-
-Merge `record_decision` + `evaluate_gate` into a single instruction `submit_decision`. One transaction records the decision AND evaluates the gate atomically. Then `execute_decision` is a second transaction only if gate passes.
-
-New flow per agent: `submit_decision` → (if approved) `execute_decision` = 1-2 transactions.
-For 3 agents: 3-6 transactions = **1.2-2.4 seconds**. Much better for demo.
-
-The audit trail is identical — the DecisionRecord still stores action, confidence, reasoning_hash, AND gate_status in one atomic write.
-
-#### R3. Access control is undefined
-
-Who can call each instruction? The document never specifies signers.
-
-If anyone can call `record_decision` or `execute_decision`, the system has no integrity.
-
-Recommended access model:
-
-```
-initialize_arena:   authority (deployer)
-register_agent:     authority
-submit_decision:    agent_authority (backend wallet designated per agent, or global operator)
-execute_decision:   operator (same backend wallet)
-record_outcome:     operator
-```
-
-The `agent_authority` or `operator` should be a field on `ArenaState`. This is simple but must be explicit in the contract.
-
-#### R4. Account sizes not estimated
-
-Anchor requires fixed account sizes at `init`. Strings like `strategy_name` and `model_id` need max lengths.
-
-Estimated sizes:
-
-```
-ArenaState:       8 (discriminator) + 32 (authority) + 32 (operator) + 4+12 (pair string, max 12)
-                  + 8 (cycle_counter) + 1 (agents_count) + 1 (min_confidence)
-                  + 8 (max_trade_size) + 8 (cooldown) + 1 (bump) = ~115 bytes
-
-AgentProfile:     8 + 32 (arena) + 8 (agent_id) + 4+32 (strategy_name)
-                  + 4+32 (model_id) + 1 (status) + 8 (max_trade_size)
-                  + 8 (last_decision_ts) + 1 (bump) = ~138 bytes
-
-DecisionRecord:   8 + 32 (arena) + 32 (agent) + 8 (cycle_id) + 32 (input_hash)
-                  + 1 (action enum) + 1 (side enum) + 8 (amount) + 1 (confidence)
-                  + 32 (reasoning_hash) + 1 (gate_status enum) + 8 (price_at_decision)
-                  + 8 (created_at) + 1 (bump) = ~173 bytes
-
-ExecutionRecord:  8 + 32 (decision) + 1 (executed) + 1 (blocked) + 8 (exec_price)
-                  + 8 (position_delta) + 8 (pnl_delta) + 8 (timestamp) + 1 (bump) = ~75 bytes
-
-ConfidenceGate:   8 + 32 (arena) + 1 (min_confidence) + 8 (max_trade_size)
-                  + 1 (allowed_actions bitmask) + 1 (bump) = ~51 bytes
-```
-
-Each DecisionRecord costs ~0.002 SOL rent. 3 agents × 50 cycles = 150 accounts = ~0.3 SOL. Fine for devnet, but should be known.
-
----
-
-### Important
-
-#### R5. Decision JSON schema is missing `price_at_decision`
-
-Current schema:
-
-```json
-{
-  "action": "buy",
-  "side": "SOL",
-  "amount": 10,
-  "confidence": 84,
-  "summary": "..."
-}
-```
-
-Problem: without `price_at_decision`, PnL cannot be calculated later. The execution price alone isn't enough — you need the reference price to show "agent decided to buy at $145, execution filled at $145.20, outcome at $148 = +$2.80".
-
-Fixed schema:
-
-```json
-{
-  "action": "buy",
-  "side": "SOL",
-  "amount": 10,
-  "confidence": 84,
-  "price": 145.00,
-  "summary": "Momentum remains positive on the latest interval."
-}
-```
-
-This `price` should also be stored on-chain in DecisionRecord for full auditability.
-
-#### R6. Hybrid agent logic split is underspecified
-
-The document says "deterministic signal generation + LLM for structured explanation" but doesn't define the boundary.
-
-Recommended split:
-
-```
-Deterministic layer (no LLM):
-  - compute indicators from market snapshot
-  - generate signal: { action: buy/sell/hold, amount: N }
-
-LLM layer:
-  - receives: signal + market data + agent persona
-  - returns: { confidence: 0-100, reasoning: string }
-```
-
-Why this split:
-
-- The action is deterministic → demo is reproducible and controllable
-- The confidence comes from LLM → the gate has real variance (some get blocked, some pass)
-- The reasoning comes from LLM → readable audit trail
-- If LLM fails, you still have the signal → graceful degradation (use default confidence=50)
-
-This is important because if LLM generates the action itself, you risk:
-- malformed outputs killing the demo
-- all 3 agents making the same decision (LLMs tend to converge)
-- no visible difference between agent strategies
-
-#### R7. Indexer strategy is not specified
-
-"Index on-chain decision and execution accounts" — how?
-
-Options:
-
-1. **RPC polling** — `getProgramAccounts` with filters every few seconds. Simple. Works for MVP with <500 accounts. This is the right choice.
-2. **WebSocket subscription** — `onProgramAccountChange`. More reactive but more complex. Overkill for MVP.
-3. **Geyser plugin** — production-grade. Not for hackathon.
-
-Recommendation: use `getProgramAccounts` with memcmp filters on account type discriminator. Refresh every 3 seconds or on-demand after cycle completion.
-
-#### R8. No mention of reasoning storage location
-
-Reasoning hash goes on-chain, but the full text needs to live somewhere.
-
-For MVP, simplest option: **in-memory store or SQLite on the backend**. The backend already has the reasoning text when the agent produces it. Store it keyed by `decision PDA pubkey`. Frontend fetches it from backend API.
-
-Do not use IPFS or Arweave for MVP — it adds complexity and latency with zero hackathon points.
-
-#### R9. `record_outcome` timing and trigger are unclear
-
-When does outcome get recorded? The document says "final measurable result" but doesn't say when or how.
-
-Recommended approach for MVP:
-
-- Outcome = price delta from decision price to next cycle's price
-- `record_outcome` is called at the START of the next cycle for the PREVIOUS cycle's decisions
-- This gives a clean 1-cycle lookback window
-
-Flow:
-```
-Cycle N:
-  1. record_outcome for Cycle N-1 decisions (using current price)
-  2. submit_decision for Cycle N
-  3. execute approved decisions
-```
-
-#### R10. Pyth on-chain price feed adds Solana depth points
-
-Currently market data is fully off-chain (Jupiter API / mock). This works but leaves points on the table for "Use of Solana (15 pts)".
-
-Low-cost improvement: read Pyth SOL/USD price feed in `execute_decision` instruction. Pass the Pyth price account as a remaining account, read and validate the price on-chain.
-
-This adds:
-- real oracle integration (judges love this)
-- on-chain price verification (not just trusting the backend)
-- ~20 lines of Rust code
-
-Pyth devnet SOL/USD feed exists and is reliable.
-
----
-
-### Nice-to-Have
-
-#### R11. Pre-seed historical data for richer demo
-
-Starting the demo cold (0 decisions) makes the dashboard look empty. Consider pre-running 5-10 cycles before the demo so there's already:
-
-- decision history visible
-- leaderboard with differentiated scores
-- some blocked decisions in the feed
-
-The "Run Next Cycle" button then adds a live decision on top of existing history.
-
-#### R12. Show Solana Explorer links in decision feed
-
-Each DecisionRecord and ExecutionRecord is an on-chain transaction. Show the transaction signature as a clickable link to Solana Explorer (devnet).
-
-This is a powerful "proof moment" for judges: click → see the actual on-chain data. Takes 30 minutes to implement but scores well on "Use of Solana" and "Demo & Presentation".
-
-#### R13. Add `cycle_id` to market snapshot
-
-The market snapshot should include a `cycle_id` that matches the on-chain cycle counter. This creates a provable link between "what data the AI saw" and "what the contract recorded."
-
-#### R14. Frontend should show the gate evaluation visually
-
-When a decision goes through the gate, show it as a visual step:
-
-```
-[Decision] → [Gate Check: confidence 84 >= 70? ✓] → [Executed] → [Result: +$2.30]
-[Decision] → [Gate Check: confidence 42 >= 70? ✗] → [Blocked]
-```
-
-This visual makes the PoI Gate layer tangible to judges in 2 seconds.
-
-#### R15. Consider `close` instruction for account cleanup
-
-After demo, hundreds of PDA accounts will hold rent. A `close_decision` instruction that refunds rent to authority keeps things tidy. Not required for MVP but shows Solana maturity.
-
-#### R16. Program should be deployed with upgrade authority
-
-For hackathon iteration speed, keep upgrade authority on devnet. This allows redeploying without changing the program ID. Obvious for experienced Solana devs but worth noting for the team.
-
----
-
-### Summary of Recommended Changes
-
-| # | Change | Severity | Effort |
-|---|--------|----------|--------|
-| R1 | Define PDA seeds | Critical | 30 min |
-| R2 | Merge record_decision + evaluate_gate | Critical | 2 hrs |
-| R3 | Define access control / signers | Critical | 1 hr |
-| R4 | Estimate account sizes | Critical | 1 hr |
-| R5 | Add price_at_decision to schema | Important | 30 min |
-| R6 | Define deterministic vs LLM boundary | Important | 1 hr |
-| R7 | Specify indexer as RPC polling | Important | 15 min |
-| R8 | Store reasoning in backend SQLite | Important | 30 min |
-| R9 | Define outcome timing (next cycle lookback) | Important | 30 min |
-| R10 | Add Pyth price feed in execute_decision | Important | 2 hrs |
-| R11 | Pre-seed demo data | Nice-to-have | 1 hr |
-| R12 | Explorer links in UI | Nice-to-have | 30 min |
-| R13 | cycle_id in market snapshot | Nice-to-have | 15 min |
-| R14 | Visual gate step in UI | Nice-to-have | 2 hrs |
-| R15 | close instruction for cleanup | Nice-to-have | 1 hr |
-| R16 | Deploy with upgrade authority | Nice-to-have | 5 min |
+## Review History
+
+This document has been through three rounds of review. All findings have been incorporated into the main sections above.
+
+### Round 1: Architecture Review (R1-R16)
+
+| # | Finding | Status |
+|---|---------|--------|
+| R1 | PDA seeds undefined | Applied — seeds defined for all 6 accounts |
+| R2 | 3 tx per decision too slow | Applied — merged record_decision + evaluate_gate into submit_decision |
+| R3 | Access control undefined | Applied — operator/authority model defined |
+| R4 | Account sizes not estimated | Applied — sizes estimated for all 6 accounts |
+| R5 | Missing price_at_decision | Superseded by P3 — oracle price on-chain, no price in off-chain JSON |
+| R6 | Hybrid agent logic underspecified | Applied — deterministic signal + LLM confidence/reasoning split |
+| R7 | Indexer strategy unspecified | Applied — getProgramAccounts with memcmp filters |
+| R8 | Reasoning storage location | Applied + hardened by P2/F1 — SQLite only with stateful lifecycle |
+| R9 | Outcome timing unclear | Applied — next-cycle lookback model |
+| R10 | Pyth oracle integration | Upgraded — structurally required for canonical pricing (P3) |
+| R11 | Pre-seed demo data | Applied — noted in Demo Topology |
+| R12 | Explorer links | Applied — noted in Frontend Architecture |
+| R13 | cycle_id in snapshot | Applied — noted in Market Data Service |
+| R14 | Visual gate step in UI | Applied — noted in Decision Feed |
+| R15 | close instruction | Applied — noted as optional instruction |
+| R16 | Deploy with upgrade authority | Applied — noted in Demo Topology |
+
+### Round 2: Follow-Up Review (P1-P3)
+
+| # | Finding | Status |
+|---|---------|--------|
+| P1 | Missing AgentPosition for persistent state | Applied — new account added |
+| P2 | Reasoning storage must be SQLite only | Applied — in-memory option removed |
+| P3 | Canonical price source undefined | Applied — Pyth oracle = single source, snapshot price separate |
+
+### Round 3: Response Findings (F1-F3)
+
+| # | Finding | Status |
+|---|---------|--------|
+| F1 | SQLite needs stateful lifecycle (pending/confirmed/failed) | Applied — full lifecycle defined |
+| F2 | AgentPosition must not include Short | Applied — PositionSide = Flat, Long only |
+| F3 | Snapshot price != oracle price at submit time | Applied — two concepts explicitly separated in Pricing Model |
