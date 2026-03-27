@@ -115,9 +115,9 @@ sequenceDiagram
 
     rect rgb(60, 40, 40)
         Note over DB,SOL: Phase 3: Submit decisions on-chain
-        RT->>DB: INSERT reasoning (status: pending)
 
         loop For each agent
+            RT->>DB: INSERT reasoning (status: pending)
             RT->>SOL: submit_decision(action, confidence, reasoning_hash)
             SOL->>PYTH: read oracle price
             SOL->>SOL: create DecisionRecord
@@ -141,7 +141,10 @@ sequenceDiagram
         Note over IDX,UI: Phase 5: Update UI
         IDX->>SOL: getProgramAccounts (poll)
         IDX->>IDX: compute leaderboard
-        UI->>IDX: fetch updated state
+        UI->>API: GET /api/agents, /api/leaderboard
+        API->>IDX: query indexed data
+        IDX-->>API: formatted results
+        API-->>UI: JSON response
         UI->>UI: render decision feed + leaderboard
     end
 ```
