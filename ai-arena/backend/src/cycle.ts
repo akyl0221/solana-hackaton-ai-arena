@@ -1,7 +1,7 @@
 import { SolanaClient } from "./solana";
 import { fetchMarketSnapshot, MarketSnapshot } from "./market";
 import { runAgent, AGENT_CONFIGS, AgentDecision } from "./agents";
-import { saveReasoning, confirmReasoning, failReasoning } from "./db";
+import { createPendingAttempt, markConfirmed, markFailed, orphanOlderAttempts } from "./db";
 
 export interface CycleResult {
   cycleId: number;
@@ -21,6 +21,7 @@ export interface AgentCycleResult {
 }
 
 let currentCycleId = 0;
+let initialized = false;
 const cycleHistory: CycleResult[] = [];
 
 export function getCycleHistory(): CycleResult[] {
@@ -31,7 +32,25 @@ export function getCurrentCycleId(): number {
   return currentCycleId;
 }
 
+export async function initCycleCounter(solana: SolanaClient): Promise<void> {
+  if (initialized) return;
+  try {
+    const decisions = await solana.getAllDecisions();
+    if (decisions.length > 0) {
+      const maxCycle = Math.max(
+        ...decisions.map((d: any) => d.account.cycleId.toNumber())
+      );
+      currentCycleId = maxCycle;
+      console.log(`Resumed cycle counter from on-chain: ${currentCycleId}`);
+    }
+  } catch (err) {
+    console.log("No existing decisions found, starting from cycle 0");
+  }
+  initialized = true;
+}
+
 export async function runCycle(solana: SolanaClient): Promise<CycleResult> {
+  await initCycleCounter(solana);
   currentCycleId++;
   const cycleId = currentCycleId;
   console.log(`\n${"=".repeat(60)}`);
@@ -58,28 +77,38 @@ export async function runCycle(solana: SolanaClient): Promise<CycleResult> {
         `Signal: ${decision.action.toUpperCase()} ${decision.amount} SOL | Confidence: ${decision.confidence}`
       );
 
-      // 2b. Save reasoning to SQLite (pending)
+      // 2b. Save reasoning to SQLite (pending attempt)
       const decisionPdaKey = solana.decisionPda(agentConfig.id, cycleId);
-      saveReasoning(
-        decisionPdaKey.toBase58(),
-        require("crypto")
-          .createHash("sha256")
-          .update(decision.reasoning)
-          .digest("hex"),
-        decision.reasoning
-      );
+      const decisionPdaStr = decisionPdaKey.toBase58();
+      const reasoningHash = require("crypto")
+        .createHash("sha256")
+        .update(decision.reasoning)
+        .digest("hex");
+      const attemptId = createPendingAttempt(decisionPdaStr, reasoningHash, decision.reasoning);
 
       // 2c. Submit decision on-chain
-      const { tx, decisionPda, gateStatus } = await solana.submitDecision(
-        agentConfig.id,
-        cycleId,
-        decision,
-        snapshotJson,
-        snapshot.price
-      );
+      let tx: string;
+      let decisionPda: string;
+      let gateStatus: string;
+      try {
+        const result = await solana.submitDecision(
+          agentConfig.id,
+          cycleId,
+          decision,
+          snapshotJson,
+          snapshot.price
+        );
+        tx = result.tx;
+        decisionPda = result.decisionPda;
+        gateStatus = result.gateStatus;
+      } catch (submitErr: any) {
+        markFailed(attemptId, submitErr.message);
+        throw submitErr;
+      }
 
-      // 2d. Update reasoning status
-      confirmReasoning(decisionPda, tx);
+      // 2d. Confirm reasoning and orphan older attempts
+      orphanOlderAttempts(decisionPda, attemptId);
+      markConfirmed(attemptId, tx);
 
       console.log(`Gate: ${gateStatus} | TX: ${tx.slice(0, 16)}...`);
 
