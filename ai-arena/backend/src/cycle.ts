@@ -57,7 +57,30 @@ export async function runCycle(solana: SolanaClient): Promise<CycleResult> {
   console.log(`CYCLE ${cycleId} START`);
   console.log(`${"=".repeat(60)}`);
 
-  // 1. Fetch market snapshot
+  // 1. Record outcomes for previous cycle
+  if (cycleId > 1) {
+    console.log(`Recording outcomes for cycle ${cycleId - 1}...`);
+    for (const agentConfig of AGENT_CONFIGS) {
+      try {
+        // Check if there's an execution for this agent's previous decision
+        const prevDecisionPda = solana.decisionPda(agentConfig.id, cycleId - 1);
+        const execPda = solana.executionPda(prevDecisionPda);
+        try {
+          await solana.connection.getAccountInfo(execPda);
+          // Execution exists, fetch current price for outcome
+          const currentSnapshot = await fetchMarketSnapshot(cycleId);
+          await solana.recordOutcome(agentConfig.id, cycleId - 1, currentSnapshot.price);
+          console.log(`  Outcome recorded for agent ${agentConfig.id} cycle ${cycleId - 1}`);
+        } catch {
+          // No execution record — decision was blocked or not executed, skip
+        }
+      } catch (err: any) {
+        console.log(`  Outcome skip for agent ${agentConfig.id}: ${err.message}`);
+      }
+    }
+  }
+
+  // 2. Fetch market snapshot
   const snapshot = await fetchMarketSnapshot(cycleId);
   console.log(
     `Market: $${snapshot.price.toFixed(2)} | Momentum: ${(snapshot.momentum * 100).toFixed(3)}% | Vol: ${(snapshot.volatility * 100).toFixed(3)}%`

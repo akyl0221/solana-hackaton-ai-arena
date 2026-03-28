@@ -4,6 +4,9 @@ import { config } from "./config";
 import { createHash } from "crypto";
 import { AgentDecision } from "./agents";
 
+// Pyth SOL/USD price feed on devnet
+const PYTH_SOL_USD_DEVNET = new PublicKey("J83w4HKfqxwcq3BEMMkPFSppX3gqekLyLJBexebFVkix");
+
 // IDL will be loaded from the built artifact
 const idl = require("../../target/idl/ai_arena.json");
 
@@ -175,9 +178,9 @@ export class SolanaClient {
         new anchor.BN(decision.amount * 1_000_000),
         decision.confidence,
         reasoningHash,
-        priceToFixed(oraclePrice),
+        priceToFixed(oraclePrice),  // fallback, used only if Pyth account missing
         new anchor.BN(Math.floor(Date.now() / 1000)),
-        new anchor.BN(500_000) // oracle confidence placeholder
+        new anchor.BN(500_000)
       )
       .accounts({
         operator: this.operator.publicKey,
@@ -188,6 +191,9 @@ export class SolanaClient {
         decisionRecord: decisionPdaKey,
         systemProgram: anchor.web3.SystemProgram.programId,
       })
+      .remainingAccounts([
+        { pubkey: PYTH_SOL_USD_DEVNET, isWritable: false, isSigner: false },
+      ])
       .rpc();
 
     // Fetch gate status

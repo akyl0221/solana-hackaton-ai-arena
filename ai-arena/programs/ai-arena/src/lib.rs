@@ -107,9 +107,9 @@ pub mod ai_arena {
         amount: u64,
         confidence: u8,
         reasoning_hash: [u8; 32],
-        oracle_price: u64,
-        oracle_timestamp: i64,
-        oracle_confidence: u64,
+        fallback_oracle_price: u64,
+        fallback_oracle_timestamp: i64,
+        fallback_oracle_confidence: u64,
     ) -> Result<()> {
         require!(confidence <= 100, ArenaError::InvalidConfidence);
 
@@ -118,6 +118,49 @@ pub mod ai_arena {
         let agent = &ctx.accounts.agent_profile;
         let position = &ctx.accounts.agent_position;
         let clock = Clock::get()?;
+
+        // --- Read oracle price ---
+        // If Pyth price account is passed as remaining account, read from it (canonical).
+        // Otherwise use fallback values (for local tests without Pyth).
+        let (oracle_price, oracle_timestamp, oracle_confidence) =
+            if let Some(pyth_account) = ctx.remaining_accounts.first() {
+                let data = pyth_account.try_borrow_data()?;
+                require!(data.len() >= 224, ArenaError::OracleError);
+
+                // Pyth V2 PriceAccount layout:
+                // Offset 20:  exponent (i32)
+                // Offset 200: agg.publish_time (i64)
+                // Offset 208: agg.price (i64)
+                // Offset 216: agg.conf (u64)
+                // Offset 224: agg.status (u32) — 1 = Trading
+                let expo = i32::from_le_bytes(data[20..24].try_into().map_err(|_| ArenaError::OracleError)?);
+                let agg_price = i64::from_le_bytes(data[208..216].try_into().map_err(|_| ArenaError::OracleError)?);
+                let agg_conf = u64::from_le_bytes(data[216..224].try_into().map_err(|_| ArenaError::OracleError)?);
+                let agg_timestamp = i64::from_le_bytes(data[200..208].try_into().map_err(|_| ArenaError::OracleError)?);
+
+                require!(agg_price > 0, ArenaError::OracleError);
+
+                // Convert to fixed-point u64 (price * 10^6)
+                let price_val = if expo >= 0 {
+                    (agg_price as u64) * 10u64.pow(expo as u32) * 1_000_000
+                } else {
+                    let divisor = 10i64.pow((-expo) as u32);
+                    ((agg_price as i128 * 1_000_000) / divisor as i128) as u64
+                };
+                let conf_val = if expo >= 0 {
+                    agg_conf * 10u64.pow(expo as u32) * 1_000_000
+                } else {
+                    let divisor = 10u64.pow((-expo) as u32);
+                    (agg_conf * 1_000_000) / divisor
+                };
+
+                let age = clock.unix_timestamp - agg_timestamp;
+                msg!("Oracle on-chain: price={} conf={} age={}s", price_val, conf_val, age);
+                (price_val, agg_timestamp, conf_val)
+            } else {
+                msg!("Fallback oracle price: {}", fallback_oracle_price);
+                (fallback_oracle_price, fallback_oracle_timestamp, fallback_oracle_confidence)
+            };
 
         // --- Gate evaluation ---
         let gate_status = evaluate_gate(
@@ -671,4 +714,8 @@ pub enum ArenaError {
     InvalidDecision,
     #[msg("Arithmetic overflow")]
     Overflow,
+    #[msg("Oracle price feed error")]
+    OracleError,
+    #[msg("Oracle price is stale")]
+    OraclePriceStale,
 }
