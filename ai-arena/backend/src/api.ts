@@ -74,7 +74,7 @@ export function createApi(solana: SolanaClient) {
     }
   });
 
-  // Get all decisions
+  // Get all decisions (raw on-chain data)
   app.get("/api/decisions", async (_req, res) => {
     try {
       const decisions = await solana.getAllDecisions();
@@ -89,6 +89,56 @@ export function createApi(solana: SolanaClient) {
         createdAt: d.account.createdAt.toNumber(),
       }));
       res.json(formatted);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Durable decision feed — built from on-chain data + SQLite reasoning
+  // Survives backend restarts, no dependency on in-memory cycleHistory
+  app.get("/api/feed", async (_req, res) => {
+    try {
+      const decisions = await solana.getAllDecisions();
+
+      // Group by cycleId
+      const byCycle: Record<number, any[]> = {};
+      for (const d of decisions) {
+        const cycleId = d.account.cycleId.toNumber();
+        if (!byCycle[cycleId]) byCycle[cycleId] = [];
+
+        // Find agent name
+        const agentPda = d.account.agent.toBase58();
+        const agentCfg = AGENT_CONFIGS.find((a) => {
+          return solana.agentProfilePda(a.id).toBase58() === agentPda;
+        });
+
+        // Get confirmed reasoning from SQLite
+        const reasoning = getReasoning(d.publicKey.toBase58());
+
+        byCycle[cycleId].push({
+          agentId: agentCfg?.id || 0,
+          agentName: agentCfg?.name || "Unknown",
+          action: Object.keys(d.account.action)[0],
+          amount: d.account.amount.toNumber(),
+          confidence: d.account.confidence,
+          gateStatus: Object.keys(d.account.gateStatus)[0],
+          oraclePrice: d.account.oraclePrice.toNumber(),
+          decisionPda: d.publicKey.toBase58(),
+          reasoning: reasoning?.full_text || null,
+          createdAt: d.account.createdAt.toNumber(),
+        });
+      }
+
+      // Sort cycles descending, return last 20
+      const cycles = Object.entries(byCycle)
+        .map(([cycleId, decisions]) => ({
+          cycleId: parseInt(cycleId),
+          decisions: decisions.sort((a, b) => a.agentId - b.agentId),
+        }))
+        .sort((a, b) => b.cycleId - a.cycleId)
+        .slice(0, 20);
+
+      res.json(cycles);
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }

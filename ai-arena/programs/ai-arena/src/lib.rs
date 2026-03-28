@@ -2,6 +2,9 @@ use anchor_lang::prelude::*;
 
 declare_id!("EpCHhXou3cP7c9CJbY6ACwjKwA56q79BeYZ5auTixBLY");
 
+// Pyth SOL/USD price feed on devnet
+pub const PYTH_SOL_USD_DEVNET: &str = "J83w4HKfqxwcq3BEMMkPFSppX3gqekLyLJBexebFVkix";
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -120,10 +123,14 @@ pub mod ai_arena {
         let clock = Clock::get()?;
 
         // --- Read oracle price ---
-        // If Pyth price account is passed as remaining account, read from it (canonical).
-        // Otherwise use fallback values (for local tests without Pyth).
+        // Runtime (devnet): Pyth account is required as remaining_accounts[0].
+        // Local tests only: no remaining accounts → use fallback values.
         let (oracle_price, oracle_timestamp, oracle_confidence) =
             if let Some(pyth_account) = ctx.remaining_accounts.first() {
+                // Validate this is the expected Pyth SOL/USD feed
+                let expected_pyth: Pubkey = PYTH_SOL_USD_DEVNET.parse().unwrap();
+                require!(pyth_account.key() == expected_pyth, ArenaError::OracleInvalidAccount);
+
                 let data = pyth_account.try_borrow_data()?;
                 require!(data.len() >= 224, ArenaError::OracleError);
 
@@ -132,7 +139,6 @@ pub mod ai_arena {
                 // Offset 200: agg.publish_time (i64)
                 // Offset 208: agg.price (i64)
                 // Offset 216: agg.conf (u64)
-                // Offset 224: agg.status (u32) — 1 = Trading
                 let expo = i32::from_le_bytes(data[20..24].try_into().map_err(|_| ArenaError::OracleError)?);
                 let agg_price = i64::from_le_bytes(data[208..216].try_into().map_err(|_| ArenaError::OracleError)?);
                 let agg_conf = u64::from_le_bytes(data[216..224].try_into().map_err(|_| ArenaError::OracleError)?);
@@ -140,7 +146,6 @@ pub mod ai_arena {
 
                 require!(agg_price > 0, ArenaError::OracleError);
 
-                // Convert to fixed-point u64 (price * 10^6)
                 let price_val = if expo >= 0 {
                     (agg_price as u64) * 10u64.pow(expo as u32) * 1_000_000
                 } else {
@@ -155,10 +160,13 @@ pub mod ai_arena {
                 };
 
                 let age = clock.unix_timestamp - agg_timestamp;
-                msg!("Oracle on-chain: price={} conf={} age={}s", price_val, conf_val, age);
+                // NOTE: Pyth devnet feed is stale (last updated Aug 2024).
+                // In production, enforce: require!(age < 300, ArenaError::OraclePriceStale);
+                msg!("Oracle on-chain: price={} conf={} age={}s (devnet feed stale)", price_val, conf_val, age);
                 (price_val, agg_timestamp, conf_val)
             } else {
-                msg!("Fallback oracle price: {}", fallback_oracle_price);
+                // Local test mode only — no Pyth account available on localnet
+                msg!("LOCAL TEST MODE: fallback oracle price={}", fallback_oracle_price);
                 (fallback_oracle_price, fallback_oracle_timestamp, fallback_oracle_confidence)
             };
 
@@ -293,11 +301,10 @@ pub mod ai_arena {
         ctx: Context<RecordOutcome>,
         current_oracle_price: u64,
     ) -> Result<()> {
-        let execution = &mut ctx.accounts.execution_record;
         let position = &mut ctx.accounts.agent_position;
-        let decision = &ctx.accounts.decision_record;
 
-        // Calculate unrealized PnL based on current oracle price
+        // Update unrealized PnL (mark-to-market) based on current oracle price.
+        // ExecutionRecord.pnl_delta is NOT overwritten — it stores realized execution PnL only.
         if position.current_size > 0 && position.average_entry_price > 0 {
             let entry = position.average_entry_price as i64;
             let current = current_oracle_price as i64;
@@ -307,23 +314,9 @@ pub mod ai_arena {
             position.unrealized_pnl = 0;
         }
 
-        // Update execution record with outcome PnL
-        if execution.executed && decision.action != DecisionAction::Hold {
-            let entry = execution.execution_price as i64;
-            let exit = current_oracle_price as i64;
-            let diff = exit - entry;
-            let outcome_pnl = match decision.action {
-                DecisionAction::Buy => (diff as i128 * decision.amount as i128 / 1_000_000) as i64,
-                DecisionAction::Sell => ((-diff) as i128 * decision.amount as i128 / 1_000_000) as i64,
-                DecisionAction::Hold => 0,
-            };
-            execution.pnl_delta = outcome_pnl;
-        }
-
         msg!(
-            "Outcome recorded: unrealized_pnl={}, execution_pnl={}",
-            position.unrealized_pnl,
-            execution.pnl_delta
+            "Outcome recorded: unrealized_pnl={}",
+            position.unrealized_pnl
         );
         Ok(())
     }
@@ -548,14 +541,6 @@ pub struct RecordOutcome<'info> {
     )]
     pub arena_state: Account<'info, ArenaState>,
 
-    pub decision_record: Account<'info, DecisionRecord>,
-
-    #[account(
-        mut,
-        constraint = execution_record.decision == decision_record.key() @ ArenaError::InvalidDecision,
-    )]
-    pub execution_record: Account<'info, ExecutionRecord>,
-
     #[account(mut)]
     pub agent_position: Account<'info, AgentPosition>,
 }
@@ -718,4 +703,6 @@ pub enum ArenaError {
     OracleError,
     #[msg("Oracle price is stale")]
     OraclePriceStale,
+    #[msg("Invalid oracle account — expected Pyth SOL/USD feed")]
+    OracleInvalidAccount,
 }

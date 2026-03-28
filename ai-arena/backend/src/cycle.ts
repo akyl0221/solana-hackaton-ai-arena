@@ -57,31 +57,26 @@ export async function runCycle(solana: SolanaClient): Promise<CycleResult> {
   console.log(`CYCLE ${cycleId} START`);
   console.log(`${"=".repeat(60)}`);
 
-  // 1. Record outcomes for previous cycle
+  // 1. Get one settlement price for outcome recording
+  const settlementSnapshot = await fetchMarketSnapshot(cycleId);
+  const settlementPrice = settlementSnapshot.price;
+
+  // 2. Record outcomes for previous cycle using single settlement price
   if (cycleId > 1) {
-    console.log(`Recording outcomes for cycle ${cycleId - 1}...`);
+    console.log(`Recording outcomes (settlement=$${settlementPrice.toFixed(2)})...`);
     for (const agentConfig of AGENT_CONFIGS) {
       try {
-        // Check if there's an execution for this agent's previous decision
-        const prevDecisionPda = solana.decisionPda(agentConfig.id, cycleId - 1);
-        const execPda = solana.executionPda(prevDecisionPda);
-        try {
-          await solana.connection.getAccountInfo(execPda);
-          // Execution exists, fetch current price for outcome
-          const currentSnapshot = await fetchMarketSnapshot(cycleId);
-          await solana.recordOutcome(agentConfig.id, cycleId - 1, currentSnapshot.price);
-          console.log(`  Outcome recorded for agent ${agentConfig.id} cycle ${cycleId - 1}`);
-        } catch {
-          // No execution record — decision was blocked or not executed, skip
-        }
+        await solana.recordOutcome(agentConfig.id, settlementPrice);
+        console.log(`  Outcome updated for agent ${agentConfig.id}`);
       } catch (err: any) {
-        console.log(`  Outcome skip for agent ${agentConfig.id}: ${err.message}`);
+        // Expected if agent has no position or already settled
+        console.log(`  Outcome skip agent ${agentConfig.id}: ${err.message?.slice(0, 60)}`);
       }
     }
   }
 
-  // 2. Fetch market snapshot
-  const snapshot = await fetchMarketSnapshot(cycleId);
+  // 3. Fetch market snapshot for agent reasoning (same price, fresh indicators)
+  const snapshot = settlementSnapshot;
   console.log(
     `Market: $${snapshot.price.toFixed(2)} | Momentum: ${(snapshot.momentum * 100).toFixed(3)}% | Vol: ${(snapshot.volatility * 100).toFixed(3)}%`
   );

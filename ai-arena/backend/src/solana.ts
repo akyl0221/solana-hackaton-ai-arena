@@ -239,19 +239,13 @@ export class SolanaClient {
 
   async recordOutcome(
     agentId: number,
-    cycleId: number,
     currentPrice: number
   ): Promise<string> {
-    const decisionPdaKey = this.decisionPda(agentId, cycleId);
-    const executionPdaKey = this.executionPda(decisionPdaKey);
-
     const tx = await this.program.methods
       .recordOutcome(priceToFixed(currentPrice))
       .accounts({
         operator: this.operator.publicKey,
         arenaState: this.arenaStatePda,
-        decisionRecord: decisionPdaKey,
-        executionRecord: executionPdaKey,
         agentPosition: this.agentPositionPda(agentId),
       })
       .rpc();

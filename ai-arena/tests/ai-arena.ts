@@ -354,8 +354,6 @@ describe("ai-arena", () => {
       .accounts({
         operator: authority.publicKey,
         arenaState: arenaStatePda,
-        decisionRecord: decisionPda,
-        executionRecord: executionPda,
         agentPosition: agentPosition1Pda,
       })
       .rpc();
@@ -363,12 +361,13 @@ describe("ai-arena", () => {
     const position = await program.account.agentPosition.fetch(agentPosition1Pda);
     expect(position.unrealizedPnl.toNumber()).to.be.greaterThan(0);
 
+    // ExecutionRecord.pnl_delta should NOT be changed by record_outcome
     const execution = await program.account.executionRecord.fetch(executionPda);
-    expect(execution.pnlDelta.toNumber()).to.be.greaterThan(0);
+    expect(execution.pnlDelta.toNumber()).to.equal(0); // was 0 at execution (buy, no realized pnl)
 
     console.log("  Outcome recorded:");
     console.log("    Unrealized PnL:", position.unrealizedPnl.toNumber());
-    console.log("    Execution PnL delta:", execution.pnlDelta.toNumber());
+    console.log("    Execution PnL delta (unchanged):", execution.pnlDelta.toNumber());
   });
 
   // =========================================================================
