@@ -1,6 +1,12 @@
 import { SolanaClient } from "./solana";
 import { fetchMarketSnapshot, MarketSnapshot } from "./market";
-import { runAgent, AGENT_CONFIGS, AgentDecision } from "./agents";
+import {
+  runAgent,
+  AGENT_CONFIGS,
+  AgentDecision,
+  AgentConfig,
+  AgentPositionContext,
+} from "./agents";
 import { createPendingAttempt, markConfirmed, markFailed, orphanOlderAttempts } from "./db";
 
 export interface CycleResult {
@@ -23,6 +29,27 @@ export interface AgentCycleResult {
 let currentCycleId = 0;
 let initialized = false;
 const cycleHistory: CycleResult[] = [];
+
+function toPositionContext(position: any): AgentPositionContext {
+  return {
+    currentSide: Object.keys(position.currentSide)[0] === "long" ? "long" : "flat",
+    currentSize: position.currentSize.toNumber() / 1_000_000,
+    averageEntryPrice: position.averageEntryPrice.toNumber() / 1_000_000,
+    realizedPnl: position.realizedPnl.toNumber() / 1_000_000,
+    unrealizedPnl: position.unrealizedPnl.toNumber() / 1_000_000,
+    totalExecuted: position.totalExecuted.toNumber(),
+  };
+}
+
+function toRuntimeAgentConfig(agent: AgentConfig, profile: any): AgentConfig {
+  return {
+    ...agent,
+    name: profile.strategyName || agent.name,
+    model: profile.modelId || agent.model,
+    maxTradeSize: profile.maxTradeSize.toNumber() / 1_000_000,
+    maxPositionSize: profile.maxPositionSize.toNumber() / 1_000_000,
+  };
+}
 
 export function getCycleHistory(): CycleResult[] {
   return cycleHistory;
@@ -84,18 +111,23 @@ export async function runCycle(solana: SolanaClient): Promise<CycleResult> {
   const snapshotJson = JSON.stringify(snapshot);
   const results: AgentCycleResult[] = [];
 
-  // 2. Run each agent
+  // 4. Run each agent
   for (const agentConfig of AGENT_CONFIGS) {
     console.log(`\n--- Agent: ${agentConfig.name} ---`);
 
     try {
-      // 2a. Generate decision (deterministic + LLM)
-      const decision = await runAgent(agentConfig.name, snapshot);
+      const profile = await solana.getAgentProfile(agentConfig.id);
+      const position = await solana.getAgentPosition(agentConfig.id);
+      const runtimeAgent = toRuntimeAgentConfig(agentConfig, profile);
+      const positionContext = toPositionContext(position);
+
+      // 4a. Generate decision (AI-first, validated, fallback-safe)
+      const decision = await runAgent(runtimeAgent, snapshot, positionContext);
       console.log(
         `Signal: ${decision.action.toUpperCase()} ${decision.amount} SOL | Confidence: ${decision.confidence}`
       );
 
-      // 2b. Save reasoning to SQLite (pending attempt)
+      // 4b. Save reasoning to SQLite (pending attempt)
       const decisionPdaKey = solana.decisionPda(agentConfig.id, cycleId);
       const decisionPdaStr = decisionPdaKey.toBase58();
       const reasoningHash = require("crypto")
@@ -104,7 +136,7 @@ export async function runCycle(solana: SolanaClient): Promise<CycleResult> {
         .digest("hex");
       const attemptId = createPendingAttempt(decisionPdaStr, reasoningHash, decision.reasoning);
 
-      // 2c. Submit decision on-chain
+      // 4c. Submit decision on-chain
       let tx: string;
       let decisionPda: string;
       let gateStatus: string;
@@ -124,7 +156,7 @@ export async function runCycle(solana: SolanaClient): Promise<CycleResult> {
         throw submitErr;
       }
 
-      // 2d. Confirm reasoning and orphan older attempts
+      // 4d. Confirm reasoning and orphan older attempts
       orphanOlderAttempts(decisionPda, attemptId);
       markConfirmed(attemptId, tx);
 
@@ -139,7 +171,7 @@ export async function runCycle(solana: SolanaClient): Promise<CycleResult> {
         txSignature: tx,
       };
 
-      // 2e. Execute if approved
+      // 4e. Execute if approved
       if (gateStatus === "approved") {
         try {
           const execTx = await solana.executeDecision(

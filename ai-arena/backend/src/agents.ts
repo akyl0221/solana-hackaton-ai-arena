@@ -1,12 +1,6 @@
 import { MarketSnapshot } from "./market";
-import Anthropic from "@anthropic-ai/sdk";
 import { config } from "./config";
-
-export interface AgentSignal {
-  action: "buy" | "sell" | "hold";
-  side: "SOL";
-  amount: number;
-}
+import { ModelProvider, resolveLiveModelProvider } from "./model-providers";
 
 export interface AgentDecision {
   action: "buy" | "sell" | "hold";
@@ -16,181 +10,373 @@ export interface AgentDecision {
   reasoning: string;
 }
 
-// ============================================================================
-// Deterministic strategies — generate signal without LLM
-// ============================================================================
-
-function momentumStrategy(snapshot: MarketSnapshot): AgentSignal {
-  const { momentum, sma10, sma30, price } = snapshot;
-
-  if (momentum > 0.01 && price > sma10) {
-    // Strong upward momentum
-    return { action: "buy", side: "SOL", amount: 10 };
-  } else if (momentum < -0.01 && price < sma10) {
-    // Downward momentum
-    return { action: "sell", side: "SOL", amount: 8 };
-  }
-  return { action: "hold", side: "SOL", amount: 0 };
+export interface AgentConfig {
+  id: number;
+  name: string;
+  model: string;
+  maxTradeSize: number;
+  maxPositionSize: number;
+  persona: string;
 }
 
-function meanReversionStrategy(snapshot: MarketSnapshot): AgentSignal {
-  const { price, sma30, volatility } = snapshot;
-  const deviation = (price - sma30) / sma30;
-
-  if (deviation < -0.02) {
-    // Price below average — buy the dip
-    return { action: "buy", side: "SOL", amount: 8 };
-  } else if (deviation > 0.02) {
-    // Price above average — sell the rip
-    return { action: "sell", side: "SOL", amount: 6 };
-  }
-  return { action: "hold", side: "SOL", amount: 0 };
+export interface AgentPositionContext {
+  currentSide: "flat" | "long";
+  currentSize: number;
+  averageEntryPrice: number;
+  realizedPnl: number;
+  unrealizedPnl: number;
+  totalExecuted: number;
 }
 
-function riskOffStrategy(snapshot: MarketSnapshot): AgentSignal {
-  const { volatility, momentum } = snapshot;
-
-  if (volatility < 0.005 && momentum > 0.005) {
-    // Low vol + slight uptrend — small buy
-    return { action: "buy", side: "SOL", amount: 3 };
-  } else if (volatility > 0.02 || momentum < -0.02) {
-    // High vol or strong downtrend — exit
-    return { action: "sell", side: "SOL", amount: 5 };
-  }
-  return { action: "hold", side: "SOL", amount: 0 };
+interface AgentRuntimeContext {
+  agent: AgentConfig;
+  snapshot: MarketSnapshot;
+  position: AgentPositionContext;
 }
 
-const strategies: Record<string, (snapshot: MarketSnapshot) => AgentSignal> = {
-  "Momentum Agent": momentumStrategy,
-  "Mean Reversion Agent": meanReversionStrategy,
-  "Risk-Off Agent": riskOffStrategy,
-};
-
-// ============================================================================
-// LLM layer — adds confidence and reasoning
-// ============================================================================
-
-let anthropic: Anthropic | null = null;
-
-function getAnthropic(): Anthropic | null {
-  if (!config.anthropicApiKey) return null;
-  if (!anthropic) {
-    anthropic = new Anthropic({ apiKey: config.anthropicApiKey });
-  }
-  return anthropic;
+interface DecisionProvider {
+  readonly mode: string;
+  generateDecision(context: AgentRuntimeContext): Promise<AgentDecision>;
 }
 
-async function llmConfidence(
-  strategyName: string,
-  signal: AgentSignal,
-  snapshot: MarketSnapshot
-): Promise<{ confidence: number; reasoning: string }> {
-  const client = getAnthropic();
+interface RawDecision {
+  action?: string;
+  side?: string;
+  amount?: number;
+  confidence?: number;
+  reasoning?: string;
+}
 
-  if (!client) {
-    // Fallback: deterministic confidence based on signal strength
-    return fallbackConfidence(strategyName, signal, snapshot);
-  }
+const DEFAULT_FALLBACK_CONFIDENCE = 45;
+const HOLD_REASONING =
+  "Safe fallback mode: unable to obtain a valid AI decision, so the agent holds position.";
 
-  try {
-    const prompt = `You are an AI trading agent named "${strategyName}".
-You analyze SOL/USDC market data and assess the confidence of trading signals.
+const AGENT_CONFIGS: AgentConfig[] = [
+  {
+    id: 1,
+    name: "Momentum Agent",
+    model: "claude-haiku",
+    maxTradeSize: 50,
+    maxPositionSize: 250,
+    persona:
+      "You are a momentum trader. Prefer buying only when price action and short-term direction are aligned. Sell or reduce only when momentum clearly turns negative. Hold when the edge is weak.",
+  },
+  {
+    id: 2,
+    name: "Mean Reversion Agent",
+    model: "claude-haiku",
+    maxTradeSize: 30,
+    maxPositionSize: 150,
+    persona:
+      "You are a mean reversion trader. Prefer buying oversold conditions below average and selling overextended moves above average. Hold when the market sits near fair value.",
+  },
+  {
+    id: 3,
+    name: "Risk-Off Agent",
+    model: "claude-haiku",
+    maxTradeSize: 20,
+    maxPositionSize: 60,
+    persona:
+      "You are a defensive risk manager. Prefer small exposure when volatility is calm and cut risk quickly during stressed or fast-falling conditions. Hold whenever uncertainty dominates.",
+  },
+];
 
-Current market data:
+let provider: DecisionProvider | null = null;
+
+function normalizeAction(action?: string): AgentDecision["action"] {
+  if (action === "buy" || action === "sell" || action === "hold") return action;
+  return "hold";
+}
+
+function normalizeSide(side?: string): AgentDecision["side"] {
+  if (side === "SOL") return side;
+  return "SOL";
+}
+
+function normalizeConfidence(confidence?: number): number {
+  if (!Number.isFinite(confidence)) return DEFAULT_FALLBACK_CONFIDENCE;
+  return Math.max(0, Math.min(100, Math.round(confidence!)));
+}
+
+function normalizeAmount(amount?: number): number {
+  if (!Number.isFinite(amount) || amount! < 0) return 0;
+  return Math.round(amount! * 1000) / 1000;
+}
+
+function safeHold(reasoning: string): AgentDecision {
+  return {
+    action: "hold",
+    side: "SOL",
+    amount: 0,
+    confidence: DEFAULT_FALLBACK_CONFIDENCE,
+    reasoning,
+  };
+}
+
+function buildDecisionPrompt(context: AgentRuntimeContext): string {
+  const { agent, snapshot, position } = context;
+  return `You are ${agent.name}, an AI trading agent for a Solana hackathon demo.
+
+${agent.persona}
+
+You must make exactly one bounded decision for SOL/USDC.
+
+Hard constraints:
+- You may only return one of: buy, sell, hold
+- Side must always be SOL
+- No leverage
+- No shorts
+- Never exceed max trade size of ${agent.maxTradeSize} SOL
+- Current position size is ${position.currentSize.toFixed(3)} SOL
+- Max position size is ${agent.maxPositionSize} SOL
+- If uncertainty is high, prefer hold
+- Return valid JSON only
+
+Current market snapshot:
 - Price: $${snapshot.price.toFixed(2)}
 - SMA(10): $${snapshot.sma10.toFixed(2)}
 - SMA(30): $${snapshot.sma30.toFixed(2)}
-- Momentum (5-period): ${(snapshot.momentum * 100).toFixed(3)}%
+- Momentum: ${(snapshot.momentum * 100).toFixed(3)}%
 - Volatility: ${(snapshot.volatility * 100).toFixed(3)}%
-- Recent prices: ${snapshot.priceHistory.map((p) => "$" + p.toFixed(2)).join(", ")}
+- Recent prices: ${snapshot.priceHistory.map((p) => p.toFixed(2)).join(", ")}
 
-The deterministic strategy has generated this signal:
-- Action: ${signal.action.toUpperCase()}
-- Amount: ${signal.amount} SOL
+Current on-chain position:
+- Side: ${position.currentSide}
+- Size: ${position.currentSize.toFixed(3)} SOL
+- Average entry price: $${position.averageEntryPrice.toFixed(2)}
+- Realized PnL: ${position.realizedPnl.toFixed(2)}
+- Unrealized PnL: ${position.unrealizedPnl.toFixed(2)}
+- Total executed decisions: ${position.totalExecuted}
 
-Based on the market data, assess the confidence of this signal (0-100) and provide a brief reasoning (2-3 sentences).
+Respond with JSON only:
+{"action":"buy|sell|hold","side":"SOL","amount":<number>,"confidence":<0-100>,"reasoning":"2-3 concise sentences"}`;
+}
 
-Respond ONLY in this JSON format:
-{"confidence": <number 0-100>, "reasoning": "<string>"}`;
+function parseJsonDecision(text: string): RawDecision {
+  const trimmed = text.trim();
 
-    const response = await client.messages.create({
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: 200,
-      messages: [{ role: "user", content: prompt }],
-    });
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  const candidate = fenced ? fenced[1].trim() : trimmed;
 
-    const text =
-      response.content[0].type === "text" ? response.content[0].text : "";
-    const parsed = JSON.parse(text);
-
-    return {
-      confidence: Math.min(100, Math.max(0, Math.round(parsed.confidence))),
-      reasoning: parsed.reasoning || "No reasoning provided.",
-    };
-  } catch (err) {
-    console.error(`LLM call failed for ${strategyName}:`, err);
-    return fallbackConfidence(strategyName, signal, snapshot);
+  try {
+    return JSON.parse(candidate);
+  } catch {
+    const start = candidate.indexOf("{");
+    const end = candidate.lastIndexOf("}");
+    if (start !== -1 && end !== -1 && end > start) {
+      return JSON.parse(candidate.slice(start, end + 1));
+    }
+    throw new Error("Model returned non-JSON output");
   }
 }
 
-function fallbackConfidence(
-  strategyName: string,
-  signal: AgentSignal,
-  snapshot: MarketSnapshot
-): { confidence: number; reasoning: string } {
-  let confidence = 50;
-  let reasoning = "";
+function validateDecision(raw: RawDecision, context: AgentRuntimeContext): AgentDecision {
+  const action = normalizeAction(raw.action);
+  const side = normalizeSide(raw.side);
+  let amount = normalizeAmount(raw.amount);
+  let confidence = normalizeConfidence(raw.confidence);
+  let reasoning = (raw.reasoning || "").trim();
 
-  if (signal.action === "hold") {
-    confidence = 60 + Math.floor(Math.random() * 20);
-    reasoning = `${strategyName}: Market conditions are neutral. Holding position.`;
-  } else if (signal.action === "buy") {
-    const strength = Math.abs(snapshot.momentum) * 1000;
-    confidence = Math.min(95, 55 + Math.floor(strength + Math.random() * 15));
-    reasoning = `${strategyName}: Positive signal detected. Momentum: ${(snapshot.momentum * 100).toFixed(2)}%, Price vs SMA10: ${((snapshot.price / snapshot.sma10 - 1) * 100).toFixed(2)}%.`;
-  } else {
-    const strength = Math.abs(snapshot.momentum) * 1000;
-    confidence = Math.min(95, 50 + Math.floor(strength + Math.random() * 15));
-    reasoning = `${strategyName}: Negative signal detected. Momentum: ${(snapshot.momentum * 100).toFixed(2)}%, Volatility: ${(snapshot.volatility * 100).toFixed(2)}%.`;
+  if (!reasoning) {
+    return safeHold(HOLD_REASONING);
   }
 
-  return { confidence, reasoning };
-}
+  amount = Math.min(amount, context.agent.maxTradeSize);
 
-// ============================================================================
-// Public API
-// ============================================================================
-
-export async function runAgent(
-  strategyName: string,
-  snapshot: MarketSnapshot
-): Promise<AgentDecision> {
-  const strategyFn = strategies[strategyName];
-  if (!strategyFn) {
-    throw new Error(`Unknown strategy: ${strategyName}`);
-  }
-
-  // Step 1: Deterministic signal
-  const signal = strategyFn(snapshot);
-
-  // Step 2: LLM confidence + reasoning
-  const { confidence, reasoning } = await llmConfidence(
-    strategyName,
-    signal,
-    snapshot
+  const remainingCapacity = Math.max(
+    0,
+    context.agent.maxPositionSize - context.position.currentSize
   );
 
+  if (action === "buy") {
+    amount = Math.min(amount, remainingCapacity);
+    if (amount <= 0) {
+      return safeHold(
+        `${context.agent.name}: buy decision reduced to hold because max position size has already been reached.`
+      );
+    }
+  }
+
+  if (action === "sell") {
+    amount = Math.min(amount, context.position.currentSize);
+    if (amount <= 0) {
+      return safeHold(
+        `${context.agent.name}: sell decision reduced to hold because there is no open long position to reduce.`
+      );
+    }
+  }
+
+  if (action === "hold") {
+    amount = 0;
+    confidence = Math.max(confidence, 40);
+  }
+
   return {
-    action: signal.action,
-    side: signal.side,
-    amount: signal.amount,
+    action,
+    side,
+    amount,
     confidence,
     reasoning,
   };
 }
 
-export const AGENT_CONFIGS = [
-  { id: 1, name: "Momentum Agent", model: "claude-haiku", maxTradeSize: 50, maxPositionSize: 250 },
-  { id: 2, name: "Mean Reversion Agent", model: "claude-haiku", maxTradeSize: 30, maxPositionSize: 150 },
-  { id: 3, name: "Risk-Off Agent", model: "claude-haiku", maxTradeSize: 20, maxPositionSize: 60 },
-];
+function deterministicSignal(context: AgentRuntimeContext): RawDecision {
+  const { snapshot, position, agent } = context;
+  const { momentum, sma10, sma30, price, volatility } = snapshot;
+  const deviation = (price - sma30) / sma30;
+
+  if (agent.name === "Momentum Agent") {
+    if (momentum > 0.01 && price > sma10 && position.currentSize < agent.maxPositionSize) {
+      return {
+        action: "buy",
+        side: "SOL",
+        amount: Math.min(agent.maxTradeSize, 10),
+        confidence: 72 + Math.min(18, Math.round(momentum * 1000)),
+        reasoning:
+          `${agent.name}: deterministic fallback sees strong upside momentum with price above SMA10, so it adds exposure within configured limits.`,
+      };
+    }
+    if (momentum < -0.01 && price < sma10 && position.currentSize > 0) {
+      return {
+        action: "sell",
+        side: "SOL",
+        amount: Math.min(position.currentSize, Math.min(agent.maxTradeSize, 8)),
+        confidence: 68 + Math.min(20, Math.round(Math.abs(momentum) * 1000)),
+        reasoning:
+          `${agent.name}: deterministic fallback sees downside momentum with price below SMA10, so it reduces the current long position.`,
+      };
+    }
+  }
+
+  if (agent.name === "Mean Reversion Agent") {
+    if (deviation < -0.02 && position.currentSize < agent.maxPositionSize) {
+      return {
+        action: "buy",
+        side: "SOL",
+        amount: Math.min(agent.maxTradeSize, 8),
+        confidence: 70 + Math.min(15, Math.round(Math.abs(deviation) * 1000)),
+        reasoning:
+          `${agent.name}: deterministic fallback sees price materially below SMA30 and treats it as a buy-the-dip setup.`,
+      };
+    }
+    if (deviation > 0.02 && position.currentSize > 0) {
+      return {
+        action: "sell",
+        side: "SOL",
+        amount: Math.min(position.currentSize, Math.min(agent.maxTradeSize, 6)),
+        confidence: 66 + Math.min(16, Math.round(Math.abs(deviation) * 1000)),
+        reasoning:
+          `${agent.name}: deterministic fallback sees price stretched above SMA30 and trims exposure into strength.`,
+      };
+    }
+  }
+
+  if (agent.name === "Risk-Off Agent") {
+    if (
+      volatility < 0.005 &&
+      momentum > 0.005 &&
+      position.currentSize < agent.maxPositionSize
+    ) {
+      return {
+        action: "buy",
+        side: "SOL",
+        amount: Math.min(agent.maxTradeSize, 3),
+        confidence: 64,
+        reasoning:
+          `${agent.name}: deterministic fallback sees calm volatility and mild positive drift, so it opens only a small defensive long.`,
+      };
+    }
+    if ((volatility > 0.02 || momentum < -0.02) && position.currentSize > 0) {
+      return {
+        action: "sell",
+        side: "SOL",
+        amount: Math.min(position.currentSize, Math.min(agent.maxTradeSize, 5)),
+        confidence: 78,
+        reasoning:
+          `${agent.name}: deterministic fallback sees stressed conditions and exits risk to protect capital.`,
+      };
+    }
+  }
+
+  return {
+    action: "hold",
+    side: "SOL",
+    amount: 0,
+    confidence: 58,
+    reasoning:
+      `${agent.name}: deterministic fallback does not see a strong bounded edge in the current snapshot, so it holds position.`,
+  };
+}
+
+class FallbackDecisionProvider implements DecisionProvider {
+  readonly mode = "deterministic-fallback";
+
+  async generateDecision(context: AgentRuntimeContext): Promise<AgentDecision> {
+    return validateDecision(deterministicSignal(context), context);
+  }
+}
+
+class LLMDecisionProvider implements DecisionProvider {
+  readonly mode: string;
+  private readonly modelProvider: ModelProvider;
+
+  constructor(modelProvider: ModelProvider) {
+    this.modelProvider = modelProvider;
+    this.mode = modelProvider.name;
+  }
+
+  async generateDecision(context: AgentRuntimeContext): Promise<AgentDecision> {
+    const prompt = buildDecisionPrompt(context);
+    const text = await this.modelProvider.generateJson(prompt);
+    const parsed = parseJsonDecision(text);
+    return validateDecision(parsed, context);
+  }
+}
+
+function buildProvider(): DecisionProvider {
+  if (config.aiMode === "fallback") {
+    return new FallbackDecisionProvider();
+  }
+
+  const modelProvider = resolveLiveModelProvider();
+  if (modelProvider) {
+    return new LLMDecisionProvider(modelProvider);
+  }
+
+  return new FallbackDecisionProvider();
+}
+
+function getProvider(): DecisionProvider {
+  if (!provider) {
+    provider = buildProvider();
+  }
+  return provider;
+}
+
+export function getAiRuntimeMode(): string {
+  return getProvider().mode;
+}
+
+export async function runAgent(
+  agent: AgentConfig,
+  snapshot: MarketSnapshot,
+  position: AgentPositionContext
+): Promise<AgentDecision> {
+  const context: AgentRuntimeContext = { agent, snapshot, position };
+  const activeProvider = getProvider();
+
+  if (!activeProvider.mode.endsWith("-live")) {
+    return activeProvider.generateDecision(context);
+  }
+
+  try {
+    return await activeProvider.generateDecision(context);
+  } catch (err) {
+    console.error(`Live AI decision failed for ${agent.name}:`, err);
+    return safeHold(
+      `${agent.name}: live AI provider failed, so the runtime switched this cycle to a safe hold decision.`
+    );
+  }
+}
+
+export { AGENT_CONFIGS };

@@ -17,12 +17,15 @@ Market Snapshot -> AI Decision -> On-Chain Record -> Confidence Gate -> Execute/
 - Blocked decisions remain as part of the audit trail
 - Oracle price is read from Pyth on-chain
 - Reasoning text is stored with a stateful lifecycle (pending/confirmed/failed)
+- Agents run in explicit runtime modes: `anthropic-live`, `openai-live`, or `deterministic-fallback`
 
 ## Architecture
 
 - **Smart Contract** (Anchor/Rust) — 6 accounts, 5 instructions, on-chain gate evaluation
 - **Backend** (Node.js/TypeScript) — agent runtime, market data, cycle orchestration, REST API
 - **Frontend** (Next.js/Tailwind) — dashboard with decision feed, leaderboard, agent cards
+
+The backend now uses a shared model-provider protocol in [`backend/src/model-providers.ts`](./backend/src/model-providers.ts), so new LLM vendors can be added by implementing the same `ModelProvider` interface instead of rewriting agent logic.
 
 See `ARCHITECTURE.md` and `ARCHITECTURE_VISUAL.md` for details.
 
@@ -91,6 +94,27 @@ npm run dev
 
 Open http://localhost:3000 and click "Run Next Cycle".
 
+### AI runtime modes
+
+- `AI_MODE=auto`:
+  - uses the preferred provider from `AI_PROVIDER`
+  - falls back to the other configured live provider if available
+  - otherwise falls back to deterministic safe mode
+- `AI_MODE=live`:
+  - expects a valid live provider API key
+- `AI_MODE=fallback`:
+  - disables live LLM calls and uses deterministic safe decisions
+
+- `AI_PROVIDER=auto`:
+  - prefers Anthropic first, then OpenAI
+- `AI_PROVIDER=anthropic`:
+  - uses Anthropic when configured
+- `AI_PROVIDER=openai`:
+  - uses OpenAI when configured
+
+In live mode, the model generates structured `action`, `amount`, `confidence`, and `reasoning`.
+In fallback mode, the backend uses deterministic bounded decisions with no randomness.
+
 ## On-Chain Program
 
 **Program ID:** `EpCHhXou3cP7c9CJbY6ACwjKwA56q79BeYZ5auTixBLY`
@@ -139,7 +163,7 @@ Open http://localhost:3000 and click "Run Next Cycle".
 | Smart Contract | Anchor 0.32.1 / Rust |
 | Backend | Node.js / TypeScript |
 | Frontend | Next.js / Tailwind CSS |
-| AI | Anthropic Claude API (optional fallback) |
+| AI | Anthropic Claude API / OpenAI API + deterministic safe fallback |
 | Oracle | Pyth SOL/USD on-chain |
 | Market Data | Jupiter Price API |
 | Database | SQLite (reasoning storage) |
