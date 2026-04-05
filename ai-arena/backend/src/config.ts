@@ -18,19 +18,7 @@ export const config = {
     process.env.OPERATOR_KEYPAIR_PATH || "~/.config/solana/id.json"
   ),
   anthropicApiKey: process.env.ANTHROPIC_API_KEY || "",
-  openaiApiKey: process.env.OPENAI_API_KEY || "",
-  aiMode:
-    process.env.AI_MODE === "live" || process.env.AI_MODE === "fallback"
-      ? process.env.AI_MODE
-      : "auto",
-  aiProvider:
-    process.env.AI_PROVIDER === "anthropic" || process.env.AI_PROVIDER === "openai"
-      ? process.env.AI_PROVIDER
-      : "auto",
-  anthropicModel:
-    process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001",
-  openaiModel:
-    process.env.OPENAI_MODEL || "gpt-4o-mini",
+  geminiApiKey: process.env.GEMINI_API_KEY || "",
   port: parseInt(process.env.PORT || "3001", 10),
   dbPath: path.resolve(__dirname, "../reasoning.db"),
 };

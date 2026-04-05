@@ -1,7 +1,7 @@
 import { SolanaClient } from "./solana";
 import { createApi } from "./api";
 import { config } from "./config";
-import { AGENT_CONFIGS, getAiRuntimeMode } from "./agents";
+import { AGENT_CONFIGS, getAIMode } from "./agents";
 
 async function setup(solana: SolanaClient) {
   // Check if arena already initialized
@@ -36,10 +36,8 @@ async function main() {
   console.log(`RPC: ${config.solanaRpcUrl}`);
   console.log(`Program: ${config.programId}`);
   console.log(`Operator: ${config.operatorKeypair.publicKey.toBase58()}`);
-  console.log(`Anthropic API: ${config.anthropicApiKey ? "configured" : "NOT SET"}`);
-  console.log(`OpenAI API: ${config.openaiApiKey ? "configured" : "NOT SET"}`);
-  console.log(`AI provider preference: ${config.aiProvider}`);
-  console.log(`AI mode: ${getAiRuntimeMode()} (${config.aiMode})`);
+  const aiMode = getAIMode();
+  console.log(`AI Mode: ${aiMode}`);
 
   const solana = new SolanaClient();
 
